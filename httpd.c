@@ -2,8 +2,10 @@
 #include<stdlib.h>
 #include<sys/types.h>
 #include<sys/socket.h>
+#include<sys/stat.h>
 #include<sys/epoll.h>
 #include<unistd.h>
+#include<fcntl.h>
 #include<netinet/in.h>
 #include<arpa/inet.h>
 #include<string.h>
@@ -64,7 +66,115 @@ static int get_line(int sock,char buf[],int len)
 }
 static echo_errno(char *str)
 {}
+void clear_head(int sock)
+{
+	int ret = 0;
+	char buf[1024];
+	do{
+		ret = get_line(sock,buf,_SIZE_);
+	}while(ret > 0 && strcmp(buf,"\n"));
+}
+static int execut_cgi(int sock,const char *path,const char *method,const char *query_string)
+{
+	int content_len = -1;
+	char buf[1024];
+	memset(buf,'\0',1024);
 
+	char method_env[1024];
+	memset(method,'\0',1024);
+	char content_length_env[100];
+	memset(content_length_env,'\0',100);
+	char query_string_env[1024];
+	memset(query_string_env,'\0',1024);
+
+	if(strcasecmp(method,"GET") == 0){
+		clear_head(sock);
+	}else{
+		int ret = 0;
+		do{
+			ret = get_line(sock,buf,sizeof(buf));
+            if(ret > 0 && strncasecmp(buf,"Content-Length:",16) == 0)
+				content_len = atoi(&buf[16]);
+		} while(ret > 0 && strcmp(buf,'\n'));
+		if(content_len = -1){
+			echo_errno("content");
+			return -1;
+		}
+	}
+	sprintf(buf,"HTTP1.0 200 OK\r\n\r\n");
+	send(sock,buf,strlen(buf),0);
+
+	int cgi_input[2];
+	int cgi_output[2];
+
+	if(pipe(cgi_input) < 0){
+		echo_errno("pipe");
+		return -2;
+	}
+	if(pipe(cgi_output) < 0){
+		echo_errno("pipe");
+		return -3;
+	}
+
+	pid_t id = fork();
+	if(id == 0){     //child
+		close(cgi_input[1]);
+		close(cgi_output[0]);
+		dup2(cgi_input[0],0);
+		dup2(cgi_output[1],1);
+		
+		sprintf(method_env,"REQUEST_METHOD=%s",method);
+		putenv(method_env);
+       
+        if(strcasecmp(method,"GET") == 0){
+			sprintf(query_string_env,"QUERY_STRING=%s",query_string);
+			putenv(query_string_env);
+		}else if(strcasecmp(method,"POST") == 0){
+			sprintf(content_length_env,"CONTENT_LENGTH=%d",content_len);
+			putenv(content_length_env);
+		}
+
+		execl(path,path,NULL);
+		exit(1);
+	}else{        //father
+		int i = 0;
+		char c = '\0';
+
+		if(strcasecmp(method,"POST") == 0){
+			for(;i < content_len;++i){
+				recv(sock,&c,1,0);
+				write(cgi_input[1],&c,1);
+			}
+		}
+
+		while(read(cgi_output[0],&c,1) > 0)
+			send(sock,&c,1,0);
+
+		waitpid(id,NULL,0);
+
+		close(cgi_input[1]);
+		close(cgi_output[0]);
+	}
+	return 0;
+}
+
+static int echo_www(int sock,const char *path,ssize_t size)
+{
+	int fd = open(path,O_RDONLY);
+	if(fd < 0){
+		echo_errno("open");
+		return  -4;
+	}
+
+	char buf[_SIZE_];
+	sprintf(buf,"HTTP1.0 200 OK\r\n\r\n");
+	send(sock,buf,strlen(buf),0);
+	
+	if(sendfile(sock,fd,NULL,size) < 0){
+		echo_errno("sendfile");
+		return -5;
+	}
+}
 static void *accept_request(void *arg)
 {
 	int cgi = 0;
@@ -119,24 +229,46 @@ static void *accept_request(void *arg)
 		++i;++j;
 	}
 
-	printf("method:%s,url_path:%s\n",method,url);
+    printf("method:%s,url_path:%s\n",method,url);
 
-	char *start = url;
-	while(*start != '\0'){
-		if(*start == '?'){
+	if(strcasecmp(method,"POST") == 0)
+		cgi = 1;
+	if(strcasecmp(method,"GET") == 0){
+		query_string = url;
+		while(*query_string != '\0' && *query_string != '?')
+			query_string++;
+		if(*query_string == '?'){
 			cgi = 1;
-			*start = '\0';
-			query_string = start+1;
-			break;
+			*query_string = '\0';
+			query_string++;
 		}
-		start++;
 	}
+
 	sprintf(path,"htdoc%s",url);
  
 	if(path[strlen(path)-1] == '/')
 		strcat(path,"index.html");
 	printf("path:%s\n",path);
 	
+	struct stat st;
+	if(stat(path,&st) < 0){
+		echo_errno("stat");
+		return  (void *)-3;
+	}else{
+		if(S_ISDIR(st.st_mode)){
+			strcpy(path,"htdoc/index.html");
+		}else if((st.st_mode & S_IXUSR) || (st.st_mode & S_IXGRP ) || (st.st_mode & S_IXOTH))
+			cgi = 1;
+	}
+
+	if(cgi){
+		execut_cgi(sock,path,method,query_string);
+	}else{
+		echo_www(sock,path,st.st_size);
+	}
+
+	close(sock);
+
 	return (void *) 0;
 }
 int main(int argc,char *argv[])
@@ -145,7 +277,7 @@ int main(int argc,char *argv[])
 		usage(argv[0]);
 		exit(1);
 	}
-	
+
 	int sock = startup(argv[1],atoi(argv[2]));
 
 	struct sockaddr_in peer;
